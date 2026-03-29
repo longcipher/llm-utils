@@ -6,7 +6,7 @@ description = "A Rust library for parsing and generating OPML 2.0 (Outline Proce
 license = { workspace = true }
 repository = { workspace = true }
 keywords = ["opml", "xml", "rss", "parser", "outliner"]
-categories = ["parsing", "data-format", "xml"]
+categories = ["parsing", "encoding"]
 readme = "README.md"
 
 [dependencies]
