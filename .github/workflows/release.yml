@@ -18,8 +18,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install Rust
+      - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust nightly with components
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
 
       - uses: taiki-e/install-action@v2
         with:
