@@ -1,8 +1,31 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{LazyLock, Mutex},
+};
 
 use derive_builder::Builder;
 use errors::OpmlError;
 use serde::{Deserialize, Serialize, Serializer};
+
+/// Cache for dynamic attribute keys to obtain `'static` references.
+/// Keys are leaked into `'static str` to satisfy serde's `serialize_field` signature.
+/// In production, consider a bounded cache or arena allocator to limit memory growth.
+static ATTR_KEY_CACHE: LazyLock<Mutex<HashMap<String, &'static str>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Get a `'static str` reference for a dynamic attribute key.
+/// Caches leaked strings to avoid unbounded memory growth.
+fn get_static_key(key: &str) -> &'static str {
+    let mut cache = ATTR_KEY_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&static_key) = cache.get(key) {
+        static_key
+    } else {
+        let owned = key.to_string();
+        let static_key: &'static str = Box::leak(owned.into_boxed_str());
+        cache.insert(key.to_string(), static_key);
+        static_key
+    }
+}
 
 pub mod errors;
 
@@ -96,9 +119,8 @@ pub struct Outline {
     #[serde(rename = "@category", skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
     /// Extra unknown attributes captured during deserialization.
-    /// Skipped during serialization to avoid `quick-xml` flattening them as
-    /// child elements instead of XML attributes.
-    #[serde(flatten, skip_serializing)]
+    /// Serialized with `@` prefix so `quick-xml` renders them as XML attributes.
+    #[serde(flatten)]
     pub extra: HashMap<String, String>,
 }
 
@@ -144,7 +166,7 @@ impl Serialize for Outline {
         if self.category.is_some() {
             field_count += 1;
         }
-        // extra is intentionally skipped in serialization
+        field_count += self.extra.len();
 
         let mut state = serializer.serialize_struct("Outline", field_count)?;
 
@@ -185,6 +207,16 @@ impl Serialize for Outline {
         }
         if let Some(ref category) = self.category {
             state.serialize_field("@category", category)?;
+        }
+
+        // Serialize extra unknown attributes with @ prefix
+        for (key, value) in &self.extra {
+            let attr_key = if key.starts_with('@') {
+                get_static_key(key)
+            } else {
+                get_static_key(&format!("@{}", key))
+            };
+            state.serialize_field(attr_key, value)?;
         }
 
         state.end()
@@ -554,5 +586,36 @@ mod tests {
         assert_eq!(group_feeds.len(), 1);
         assert_eq!(group_feeds[0].group, "Parent");
         assert_eq!(group_feeds[0].feeds[0].text, Some("Child".to_string()));
+    }
+
+    #[test]
+    fn test_extra_attributes_roundtrip() {
+        let xml = r#"
+            <?xml version="1.0"?>
+            <opml version="2.0">
+                <head><title>Test</title></head>
+                <body>
+                    <outline text="Feed" type="rss" xmlUrl="https://example.com/feed.xml" customAttr="customValue" another="123" />
+                </body>
+            </opml>
+        "#;
+
+        let opml = super::Opml::from_str(xml).unwrap();
+        assert_eq!(opml.body.outlines[0].extra.len(), 2);
+        assert_eq!(
+            opml.body.outlines[0].extra.get("@customAttr"),
+            Some(&"customValue".to_string())
+        );
+        assert_eq!(opml.body.outlines[0].extra.get("@another"), Some(&"123".to_string()));
+
+        // Serialize back and parse again - extra attributes should be preserved
+        let xml_string = opml.to_string().unwrap();
+        let reparsed = super::Opml::from_str(&xml_string).unwrap();
+        assert_eq!(reparsed.body.outlines[0].extra.len(), 2);
+        assert_eq!(
+            reparsed.body.outlines[0].extra.get("@customAttr"),
+            Some(&"customValue".to_string())
+        );
+        assert_eq!(reparsed.body.outlines[0].extra.get("@another"), Some(&"123".to_string()));
     }
 }

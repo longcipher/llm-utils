@@ -25,14 +25,13 @@ lint:
 test:
   cargo test --all-features
 
-# Run BDD scenarios
+# Run BDD scenarios (placeholder — no BDD crate yet)
 bdd:
-  cargo test -p common --test bdd
+  @echo "No BDD tests configured."
 
-# Run both TDD and BDD suites
+# Run all test suites
 test-all:
   cargo test --all-features
-  cargo test -p common --test bdd
 
 # Run tests with coverage
 test-coverage:
@@ -74,6 +73,7 @@ setup:
   cargo install cargo-machete
   cargo install taplo-cli
   cargo install typos-cli
+  cargo install cargo-tarpaulin
 
 # Generate documentation for the workspace
 docs:

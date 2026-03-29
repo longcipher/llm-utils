@@ -7,6 +7,43 @@ pub enum Newlines {
     None,
 }
 
+/// Represents a single step in the text cleaning pipeline.
+/// Each step processes a character and updates the cleaning state.
+enum CleanStep {
+    /// Character should be emitted as-is
+    Emit(char),
+    /// A whitespace character was encountered
+    Whitespace,
+    /// A newline sequence was encountered
+    Newline(usize),
+    /// An escaped whitespace/newline sequence was processed
+    EscapedWhitespace,
+    /// An escaped newline sequence was processed
+    EscapedNewline,
+    /// A citation was removed. If true, the next character is punctuation
+    /// and we should remove the trailing space before it.
+    CitationRemoved(bool),
+    /// A non-citation bracket and its contents should be replayed
+    ReplayNonCitation(Vec<char>),
+}
+
+/// Internal state for the single-pass text cleaner.
+struct CleanState {
+    result: String,
+    consecutive_newlines: usize,
+    last_was_space: bool,
+}
+
+impl CleanState {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            result: String::with_capacity(capacity),
+            consecutive_newlines: 0,
+            last_was_space: false,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct TextCleaner {
     pub newlines: Newlines,
@@ -54,201 +91,221 @@ impl TextCleaner {
     /// character filtering to preserve all visible text including URLs, code,
     /// and multilingual content.
     pub fn run(&self, text: &str) -> String {
-        let mut result = String::with_capacity(text.len());
+        let mut state = CleanState::with_capacity(text.len());
         let mut chars = text.chars().peekable();
-        let mut consecutive_newlines: usize = 0;
-        let mut last_was_space = false;
 
         while let Some(c) = chars.next() {
-            match c {
-                // Handle various newline sequences
-                '\r' => {
-                    // Check for \r\n sequence
-                    if chars.peek() == Some(&'\n') {
-                        chars.next();
-                    }
-                    consecutive_newlines += 1;
-                    last_was_space = false;
-                }
-                '\n' | '\x0B' | '\x0C' | '\u{2028}' => {
-                    consecutive_newlines += 1;
-                    last_was_space = false;
-                }
-                // Handle paragraph separator
-                '\u{2029}' => {
-                    consecutive_newlines += 2;
-                    last_was_space = false;
-                }
-                // Handle various whitespace characters
-                ' ' |
-                '\t' |
-                '\u{00A0}' |
-                '\u{1680}' |
-                '\u{2000}'..='\u{200A}' |
-                '\u{202F}' |
-                '\u{205F}' |
-                '\u{3000}' => {
-                    if consecutive_newlines > 0 {
-                        // Emit pending newlines (mode-aware)
-                        match self.newlines {
-                            Newlines::Space => {
-                                result.push(' ');
-                                consecutive_newlines = 0;
-                                last_was_space = true;
-                                continue;
-                            }
-                            Newlines::Single => {
-                                result.push('\n');
-                                consecutive_newlines = 0;
-                            }
-                            Newlines::TwoPlus => {
-                                let count = consecutive_newlines.min(2);
-                                for _ in 0..count {
-                                    result.push('\n');
-                                }
-                                consecutive_newlines = 0;
-                            }
-                            Newlines::None => {
-                                for _ in 0..consecutive_newlines {
-                                    result.push('\n');
-                                }
-                                consecutive_newlines = 0;
-                            }
-                        }
-                    }
-                    if !last_was_space {
-                        result.push(' ');
-                        last_was_space = true;
-                    }
-                }
-                // Handle escaped whitespace sequences (like \s, \t, \n, \r)
-                '\\' => {
-                    if let Some(&next) = chars.peek() {
-                        match next {
-                            's' | 't' => {
-                                chars.next(); // consume the character after backslash
-                                if !last_was_space && consecutive_newlines == 0 {
-                                    result.push(' ');
-                                    last_was_space = true;
-                                }
-                            }
-                            'n' | 'r' => {
-                                chars.next(); // consume the character after backslash
-                                consecutive_newlines += 1;
-                                last_was_space = false;
-                            }
-                            _ => {
-                                emit_newlines(
-                                    &mut result,
-                                    &self.newlines,
-                                    &mut consecutive_newlines,
-                                );
-                                result.push('\\');
-                                last_was_space = false;
-                            }
-                        }
-                    }
-                }
-                // Handle citations [1], [1, 2], [1-3] inline
-                '[' if self.remove_citations => {
-                    // Try to match citation pattern: [digits with optional , - spaces]
-                    let mut buf = Vec::new();
-                    buf.push('[');
-                    let mut is_citation = false;
+            let step = self.classify_char(c, &mut chars);
 
-                    while let Some(&next) = chars.peek() {
-                        if next.is_ascii_digit() || next == ',' || next == '-' || next == ' ' {
-                            buf.push(next);
-                            chars.next();
-                        } else if next == ']' &&
-                            buf.len() > 1 &&
-                            buf[1..].iter().any(|b| b.is_ascii_digit())
-                        {
-                            is_citation = true;
-                            chars.next(); // consume ']'
-                            // Remove trailing space before punctuation
-                            if last_was_space &&
-                                result.ends_with(' ') &&
-                                let Some(&ahead) = chars.peek() &&
-                                matches!(ahead, '.' | ',' | '?' | '!' | ':' | ';')
-                            {
-                                result.pop();
-                            }
-                            break;
-                        } else {
-                            break;
-                        }
-                    }
-
-                    if !is_citation {
-                        // Flush pending newlines, then replay buffer
-                        emit_newlines(&mut result, &self.newlines, &mut consecutive_newlines);
-                        for ch in buf {
-                            result.push(ch);
-                        }
-                        last_was_space = false;
+            match step {
+                CleanStep::Newline(count) => {
+                    self.handle_newline(&mut state, count);
+                }
+                CleanStep::Whitespace => {
+                    self.handle_whitespace(&mut state);
+                }
+                CleanStep::EscapedWhitespace => {
+                    self.handle_escaped_whitespace(&mut state);
+                }
+                CleanStep::EscapedNewline => {
+                    state.consecutive_newlines += 1;
+                    state.last_was_space = false;
+                }
+                CleanStep::CitationRemoved(remove_trailing_space) => {
+                    // Citation was already consumed in classify_char
+                    // If the next character is punctuation, remove the trailing space
+                    if remove_trailing_space && state.last_was_space && state.result.ends_with(' ')
+                    {
+                        state.result.pop();
+                        state.last_was_space = false;
                     }
                 }
-                // Handle regular characters
-                _ => {
-                    // Emit accumulated newlines before content
-                    emit_newlines(&mut result, &self.newlines, &mut consecutive_newlines);
-
-                    // Filter unwanted characters (blacklist: only remove control chars)
-                    if self.remove_non_basic_ascii && !is_valid_text_char(c) {
-                        continue;
+                CleanStep::ReplayNonCitation(buf) => {
+                    self.emit_newlines(&mut state);
+                    for ch in buf {
+                        state.result.push(ch);
                     }
-
-                    result.push(c);
-                    last_was_space = false;
+                    state.last_was_space = false;
+                }
+                CleanStep::Emit(ch) => {
+                    self.emit_newlines(&mut state);
+                    if !self.remove_non_basic_ascii || is_valid_text_char(ch) {
+                        state.result.push(ch);
+                    }
+                    state.last_was_space = false;
                 }
             }
         }
 
         // Handle any trailing newlines
-        if consecutive_newlines > 0 {
-            emit_newlines(&mut result, &self.newlines, &mut consecutive_newlines);
+        if state.consecutive_newlines > 0 {
+            self.emit_newlines(&mut state);
         }
 
-        // Single-pass trailing cleanup: trim leading whitespace and trim
-        // trailing spaces.
-        trim_trailing_spaces(&result)
+        trim_trailing_spaces(&state.result)
     }
-}
 
-/// Emit accumulated newlines to the result buffer based on the configured mode.
-/// Single/None modes: emit all accumulated newlines.
-/// TwoPlus mode: cap at 2.
-/// Space mode: emit a single space.
-#[inline]
-fn emit_newlines(result: &mut String, newlines: &Newlines, consecutive_newlines: &mut usize) {
-    if *consecutive_newlines == 0 {
-        return;
-    }
-    match newlines {
-        Newlines::Space => {
-            result.push(' ');
-            *consecutive_newlines = 0;
-        }
-        Newlines::Single => {
-            result.push('\n');
-            *consecutive_newlines = 0;
-        }
-        Newlines::TwoPlus => {
-            let count = (*consecutive_newlines).min(2);
-            for _ in 0..count {
-                result.push('\n');
+    /// Classify a character and return the appropriate cleaning step.
+    fn classify_char(
+        &self,
+        c: char,
+        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    ) -> CleanStep {
+        match c {
+            // Handle various newline sequences
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                CleanStep::Newline(1)
             }
-            *consecutive_newlines = 0;
-        }
-        Newlines::None => {
-            for _ in 0..*consecutive_newlines {
-                result.push('\n');
-            }
-            *consecutive_newlines = 0;
+            '\n' | '\x0B' | '\x0C' | '\u{2028}' => CleanStep::Newline(1),
+            '\u{2029}' => CleanStep::Newline(2),
+
+            // Handle various whitespace characters
+            ' ' |
+            '\t' |
+            '\u{00A0}' |
+            '\u{1680}' |
+            '\u{2000}'..='\u{200A}' |
+            '\u{202F}' |
+            '\u{205F}' |
+            '\u{3000}' => CleanStep::Whitespace,
+
+            // Handle escaped whitespace/newline sequences
+            '\\' => self.classify_escape(chars),
+
+            // Handle citations
+            '[' if self.remove_citations => self.classify_citation(chars),
+
+            // Regular character
+            _ => CleanStep::Emit(c),
         }
     }
-    *consecutive_newlines = 0;
+
+    /// Classify an escape sequence after backslash.
+    fn classify_escape(&self, chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> CleanStep {
+        if let Some(&next) = chars.peek() {
+            match next {
+                's' | 't' => {
+                    chars.next();
+                    CleanStep::EscapedWhitespace
+                }
+                'n' | 'r' => {
+                    chars.next();
+                    CleanStep::EscapedNewline
+                }
+                _ => CleanStep::Emit('\\'),
+            }
+        } else {
+            CleanStep::Emit('\\')
+        }
+    }
+
+    /// Classify a potential citation starting with '['.
+    fn classify_citation(&self, chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> CleanStep {
+        let mut buf = vec!['['];
+        let mut is_citation = false;
+
+        while let Some(&next) = chars.peek() {
+            if next.is_ascii_digit() || next == ',' || next == '-' || next == ' ' {
+                buf.push(next);
+                chars.next();
+            } else if next == ']' && buf.len() > 1 && buf[1..].iter().any(|b| b.is_ascii_digit()) {
+                is_citation = true;
+                chars.next();
+                break;
+            } else {
+                break;
+            }
+        }
+
+        if is_citation {
+            // Check if the next character is punctuation - if so, we should
+            // remove the trailing space before it
+            let next_is_punctuation =
+                chars.peek().is_some_and(|&c| matches!(c, '.' | ',' | '?' | '!' | ':' | ';'));
+            CleanStep::CitationRemoved(next_is_punctuation)
+        } else {
+            CleanStep::ReplayNonCitation(buf)
+        }
+    }
+
+    /// Handle a newline character by updating the consecutive newline count.
+    fn handle_newline(&self, state: &mut CleanState, count: usize) {
+        state.consecutive_newlines += count;
+        state.last_was_space = false;
+    }
+
+    /// Handle a whitespace character, emitting pending newlines if needed.
+    fn handle_whitespace(&self, state: &mut CleanState) {
+        if state.consecutive_newlines > 0 {
+            match self.newlines {
+                Newlines::Space => {
+                    state.result.push(' ');
+                    state.consecutive_newlines = 0;
+                    state.last_was_space = true;
+                    return;
+                }
+                Newlines::Single => {
+                    state.result.push('\n');
+                    state.consecutive_newlines = 0;
+                }
+                Newlines::TwoPlus => {
+                    let count = state.consecutive_newlines.min(2);
+                    for _ in 0..count {
+                        state.result.push('\n');
+                    }
+                    state.consecutive_newlines = 0;
+                }
+                Newlines::None => {
+                    for _ in 0..state.consecutive_newlines {
+                        state.result.push('\n');
+                    }
+                    state.consecutive_newlines = 0;
+                }
+            }
+        }
+        if !state.last_was_space {
+            state.result.push(' ');
+            state.last_was_space = true;
+        }
+    }
+
+    /// Handle an escaped whitespace sequence (e.g., \s, \t).
+    fn handle_escaped_whitespace(&self, state: &mut CleanState) {
+        if !state.last_was_space && state.consecutive_newlines == 0 {
+            state.result.push(' ');
+            state.last_was_space = true;
+        }
+    }
+
+    /// Emit accumulated newlines to the result buffer.
+    fn emit_newlines(&self, state: &mut CleanState) {
+        if state.consecutive_newlines == 0 {
+            return;
+        }
+        match self.newlines {
+            Newlines::Space => {
+                state.result.push(' ');
+            }
+            Newlines::Single => {
+                state.result.push('\n');
+            }
+            Newlines::TwoPlus => {
+                let count = state.consecutive_newlines.min(2);
+                for _ in 0..count {
+                    state.result.push('\n');
+                }
+            }
+            Newlines::None => {
+                for _ in 0..state.consecutive_newlines {
+                    state.result.push('\n');
+                }
+            }
+        }
+        state.consecutive_newlines = 0;
+    }
 }
 
 /// Check if a character should be kept in cleaned text.

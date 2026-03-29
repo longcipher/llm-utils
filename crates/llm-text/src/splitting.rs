@@ -61,6 +61,38 @@ pub fn split_text_into_indices(text: &str, keep_separator: bool) -> Vec<Range<us
     indices
 }
 
+/// Trait for counting tokens in text. Implement this to integrate with
+/// specific tokenizers (e.g., tiktoken, HuggingFace tokenizers).
+pub trait Tokenizer {
+    /// Count the number of tokens in the given text.
+    fn count_tokens(&self, text: &str) -> u32;
+}
+
+/// A simple character-based tokenizer that approximates token count.
+/// Useful as a fallback when no real tokenizer is available.
+#[derive(Debug, Clone, Default)]
+pub struct CharRatioTokenizer {
+    /// Approximate characters per token (default: 4, similar to GPT models)
+    pub chars_per_token: f32,
+}
+
+impl CharRatioTokenizer {
+    pub fn new() -> Self {
+        Self { chars_per_token: 4.0 }
+    }
+
+    pub fn with_ratio(mut self, ratio: f32) -> Self {
+        self.chars_per_token = ratio;
+        self
+    }
+}
+
+impl Tokenizer for CharRatioTokenizer {
+    fn count_tokens(&self, text: &str) -> u32 {
+        (text.len() as f32 / self.chars_per_token).ceil() as u32
+    }
+}
+
 // --- From mod.rs ---
 
 #[derive(Default)]
@@ -68,11 +100,23 @@ pub struct TextSplitter {
     pub split_separator: Separator,
     pub recursive: bool,
     pub clean_text: bool,
+    /// Optional maximum token size for chunks. When set, recursive splitting
+    /// will only drill down to finer separators when a chunk exceeds this limit.
+    pub max_token_size: Option<u32>,
+    /// Optional tokenizer for accurate token counting. If not set, token
+    /// counting is skipped and max_token_size constraint is ignored.
+    pub tokenizer: Option<std::sync::Arc<dyn Tokenizer + Send + Sync>>,
 }
 
 impl TextSplitter {
     pub fn new() -> Self {
-        Self { split_separator: Separator::TwoPlusEoL, recursive: true, clean_text: true }
+        Self {
+            split_separator: Separator::TwoPlusEoL,
+            recursive: true,
+            clean_text: true,
+            max_token_size: None,
+            tokenizer: None,
+        }
     }
 
     pub fn split_text(&self, text: &str) -> Option<VecDeque<TextSplit>> {
@@ -84,12 +128,24 @@ impl TextSplitter {
 
         let mut split_separator = self.split_separator.clone();
         let split_indices = if self.recursive {
-            loop {
-                let split_indices = split_separator.split_text_into_indices(&base_text);
-                if split_indices.len() > 1 {
-                    break split_indices;
-                } else {
-                    split_separator = split_separator.next()?;
+            // When max_token_size is set with a tokenizer, only drill down to
+            // finer separators when chunks exceed the token limit
+            if let (Some(max_tokens), Some(tokenizer)) = (self.max_token_size, &self.tokenizer) {
+                self.split_with_token_limit(
+                    &base_text,
+                    &mut split_separator,
+                    max_tokens,
+                    tokenizer,
+                )?
+            } else {
+                // Original behavior: recursive split without token constraints
+                loop {
+                    let split_indices = split_separator.split_text_into_indices(&base_text);
+                    if split_indices.len() > 1 {
+                        break split_indices;
+                    } else {
+                        split_separator = split_separator.next()?;
+                    }
                 }
             }
         } else {
@@ -99,12 +155,58 @@ impl TextSplitter {
             return None;
         }
 
-        Some(
+        // Create splits, computing token counts if a tokenizer is available
+        let splits: VecDeque<TextSplit> = if let Some(ref tokenizer) = self.tokenizer {
+            split_indices
+                .into_iter()
+                .map(|indices| {
+                    TextSplit::with_tokenizer(
+                        &indices,
+                        &split_separator,
+                        &base_text,
+                        tokenizer.as_ref(),
+                    )
+                })
+                .collect()
+        } else {
             split_indices
                 .into_iter()
                 .map(|indices| TextSplit::new(&indices, &split_separator, &base_text))
-                .collect(),
-        )
+                .collect()
+        };
+
+        Some(splits)
+    }
+
+    /// Split text with token size constraint. Only drill down to finer separators
+    /// when chunks exceed max_token_size, preserving larger context when possible.
+    fn split_with_token_limit(
+        &self,
+        base_text: &Arc<str>,
+        split_separator: &mut Separator,
+        max_tokens: u32,
+        tokenizer: &Arc<dyn Tokenizer + Send + Sync>,
+    ) -> Option<Vec<Range<usize>>> {
+        loop {
+            let split_indices = split_separator.split_text_into_indices(base_text);
+
+            // Check if any chunk exceeds the token limit
+            let needs_finer_split = split_indices.iter().any(|indices| {
+                let chunk_text = &base_text[indices.clone()];
+                tokenizer.count_tokens(chunk_text) > max_tokens
+            });
+
+            if needs_finer_split && split_indices.len() > 1 {
+                // Some chunks are too large, try finer separator
+                *split_separator = split_separator.next()?;
+            } else if split_indices.len() > 1 {
+                // All chunks fit within token limit, or we've reached finest separator
+                break Some(split_indices);
+            } else {
+                // Single chunk, try finer separator
+                *split_separator = split_separator.next()?;
+            }
+        }
     }
 
     pub fn on_two_plus_newline(mut self) -> Self {
@@ -152,7 +254,28 @@ impl TextSplitter {
         self
     }
 
-    pub fn split_split(
+    /// Set the maximum token size for chunks. When set with a tokenizer,
+    /// recursive splitting will only drill down to finer separators when
+    /// a chunk exceeds this limit.
+    pub fn max_token_size(mut self, max_tokens: u32) -> Self {
+        self.max_token_size = Some(max_tokens);
+        self
+    }
+
+    /// Set the tokenizer for accurate token counting.
+    pub fn with_tokenizer(mut self, tokenizer: Arc<dyn Tokenizer + Send + Sync>) -> Self {
+        self.tokenizer = Some(tokenizer);
+        self
+    }
+
+    /// Split a TextSplit into smaller splits using the configured separator.
+    /// This is the public API that accepts a TextSplit directly.
+    pub fn split_text_split(self, split: &TextSplit) -> Option<VecDeque<TextSplit>> {
+        self.split_split_inner(&split.base_text, &split.indices)
+    }
+
+    /// Internal implementation that works with raw base_text and indices.
+    fn split_split_inner(
         self,
         base_text: &Arc<str>,
         split_indices: &Range<usize>,
@@ -231,6 +354,7 @@ pub struct TextSplit {
     pub indices: Range<usize>,
     pub split_separator: Separator,
     pub base_text: Arc<str>,
+    /// Token count computed by the tokenizer, if one was provided.
     pub token_count: Option<u32>,
 }
 
@@ -240,8 +364,23 @@ impl TextSplit {
             indices: indices.clone(),
             split_separator: split_separator.clone(),
             base_text: Arc::clone(base_text),
-
             token_count: None,
+        }
+    }
+
+    /// Create a new TextSplit with token count computed using the provided tokenizer.
+    fn with_tokenizer(
+        indices: &Range<usize>,
+        split_separator: &Separator,
+        base_text: &Arc<str>,
+        tokenizer: &dyn Tokenizer,
+    ) -> Self {
+        let text = &base_text[indices.clone()];
+        Self {
+            indices: indices.clone(),
+            split_separator: split_separator.clone(),
+            base_text: Arc::clone(base_text),
+            token_count: Some(tokenizer.count_tokens(text)),
         }
     }
 
@@ -256,7 +395,7 @@ impl TextSplit {
     pub fn split(&self) -> Option<VecDeque<TextSplit>> {
         TextSplitter::default()
             .on_separator(&self.split_separator.next()?)
-            .split_split(&self.base_text, &self.indices)
+            .split_split_inner(&self.base_text, &self.indices)
     }
 }
 
@@ -335,14 +474,9 @@ impl Separator {
     pub fn split_text_into_indices<T: AsRef<str>>(&self, text: T) -> Vec<Range<usize>> {
         let mut split_indices: Vec<Range<usize>> = Vec::new();
         match self {
-            Self::TwoPlusEoL | Self::SingleEol => {
-                let pattern_matches = match self {
-                    Self::TwoPlusEoL => TWO_PLUS_NEWLINE_REGEX.find_iter(text.as_ref()),
-                    Self::SingleEol => SINGLE_NEWLINE_REGEX.find_iter(text.as_ref()),
-                    _ => unreachable!(),
-                };
+            Self::TwoPlusEoL => {
                 let mut last_end = 0;
-                for m in pattern_matches {
+                for m in TWO_PLUS_NEWLINE_REGEX.find_iter(text.as_ref()) {
                     let start = m.start();
                     let end = m.end();
                     if start > last_end {
@@ -353,6 +487,21 @@ impl Separator {
                 }
                 if last_end < text.as_ref().len() {
                     split_indices.push(Range { start: last_end, end: text.as_ref().len() });
+                }
+            }
+            Self::SingleEol => {
+                // Use native string matching instead of regex for single newline
+                let text_ref = text.as_ref();
+                let mut last_end = 0;
+                for (idx, _) in text_ref.match_indices('\n') {
+                    if idx > last_end {
+                        split_indices.push(Range { start: last_end, end: idx });
+                    }
+                    split_indices.push(Range { start: idx, end: idx + 1 });
+                    last_end = idx + 1;
+                }
+                if last_end < text_ref.len() {
+                    split_indices.push(Range { start: last_end, end: text_ref.len() });
                 }
             }
             Self::SentencesRuleBased => {
@@ -457,4 +606,3 @@ impl Separator {
 
 pub static TWO_PLUS_NEWLINE_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\n{2,}").unwrap());
-pub static SINGLE_NEWLINE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\n").unwrap());
