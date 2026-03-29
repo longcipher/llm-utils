@@ -1,5 +1,10 @@
 # llm-utils
 
+[![DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/longcipher/llm-utils)
+[![Context7](https://img.shields.io/badge/Website-context7.com-blue)](https://context7.com/longcipher/llm-utils)
+
+![llm-utils](https://socialify.git.ci/longcipher/llm-utils/image?font=Source+Code+Pro&language=1&name=1&owner=1&pattern=Circuit+Board&theme=Auto)
+
 Rust utilities for LLM text processing. Workspace provides shared libraries for cleaning, splitting, and extracting content from text and HTML for use with large language models.
 
 ## Crates
