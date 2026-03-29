@@ -1,10 +1,12 @@
 [package]
 name = "llm-text"
+version = { workspace = true }
+edition = { workspace = true }
 description = "A Rust library for processing text for LLM consumption"
-license.workspace = true
-repository.workspace = true
-version.workspace = true
-edition.workspace = true
+license = { workspace = true }
+repository = { workspace = true }
+keywords = ["llm", "text-processing", "html", "nlp", "text-extraction"]
+categories = ["text-processing", "web-programming", "parsing"]
 readme = "README.md"
 
 [dependencies]
