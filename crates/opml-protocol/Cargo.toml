@@ -1,0 +1,16 @@
+[package]
+name = "opml-protocol"
+version = { workspace = true }
+edition = { workspace = true }
+description = "A Rust library for parsing and generating OPML 2.0 (Outline Processor Markup Language) files"
+license = { workspace = true }
+repository = { workspace = true }
+keywords = ["opml", "xml", "rss", "parser", "outliner"]
+categories = ["parsing", "data-format", "xml"]
+readme = "README.md"
+
+[dependencies]
+derive_builder = { workspace = true }
+quick-xml = { workspace = true, features = ["serialize"] }
+serde = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }

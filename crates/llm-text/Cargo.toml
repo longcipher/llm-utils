@@ -1,0 +1,17 @@
+[package]
+name = "llm-text"
+description = "A Rust library for processing text for LLM consumption"
+license.workspace = true
+repository.workspace = true
+version.workspace = true
+edition.workspace = true
+readme = "README.md"
+
+[dependencies]
+dom_smoothie = { workspace = true }
+eyre = { workspace = true }
+html2text = { workspace = true }
+linkify = { workspace = true }
+regex = { workspace = true }
+unicode-segmentation = { workspace = true }
+url = { workspace = true }
