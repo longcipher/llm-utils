@@ -14,7 +14,6 @@ resolver = "3"
 [workspace.dependencies]
 clap = "4.6.1"
 config = "0.15.23"
-cucumber = "0.23.0"
 derive_builder = "0.20.2"
 dom_smoothie = "0.17.0"
 eyre = "0.6.12"
